@@ -1,0 +1,98 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r producer/requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  pipeline-smoke-test:
+    name: pipeline-smoke-test
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      NUM_EVENTS: "20"
+      EVENT_INTERVAL_SECONDS: "0.2"
+      EXPECTED_EVENTS: "20"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images and start Kafka
+        run: docker compose up -d --build kafka
+
+      - name: Wait for Kafka to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            status="$(docker inspect --format='{{.State.Health.Status}}' \
+              $(docker compose ps -q kafka))"
+            if [ "$status" = "healthy" ]; then
+              echo "Kafka is healthy"
+              exit 0
+            fi
+            echo "Waiting for Kafka ($i)..."
+            sleep 5
+          done
+          echo "Kafka did not become healthy in time"
+          docker compose logs kafka
+          exit 1
+
+      - name: Run consumer and producer
+        run: |
+          docker compose up -d consumer
+          docker compose run --rm producer
+          # Give the consumer a moment to finish writing after the last message.
+          sleep 5
+          docker compose logs consumer
+
+      - name: Check pipeline output
+        run: scripts/check_output.sh output/orders.log 20
+
+      - name: Show logs if something failed
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
+
+  deploy:
+    name: deploy-to-ec2
+    needs: [test, pipeline-smoke-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [ -z "$EC2_HOST" ] || [ -z "$EC2_USER" ] || [ -z "$EC2_SSH_KEY" ]; then
+            echo "::warning::EC2 secrets are not set, deploy step skipped."
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" \
+            "cd ~/kafka-event-pipeline && git pull origin main && \
+             docker compose up -d --build kafka && sleep 20 && \
+             docker compose up -d consumer && docker compose run --rm producer"

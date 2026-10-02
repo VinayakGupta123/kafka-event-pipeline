@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Runs the tests before every push and aborts the push if they fail.
+PY="$(command -v python3 || command -v python)"
+echo "pre-push: running tests..."
+if ! "$PY" -m unittest discover -s tests; then
+  echo "pre-push: tests failed, push aborted."
+  exit 1
+fi
